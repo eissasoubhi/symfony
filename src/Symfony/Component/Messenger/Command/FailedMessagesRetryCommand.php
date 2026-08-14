@@ -25,7 +25,9 @@ use Symfony\Component\Messenger\Event\WorkerMessageReceivedEvent;
 use Symfony\Component\Messenger\Event\WorkerMessageSkipEvent;
 use Symfony\Component\Messenger\EventListener\StopWorkerOnMessageLimitListener;
 use Symfony\Component\Messenger\MessageBusInterface;
+use Symfony\Component\Messenger\Stamp\NonSendableStampInterface;
 use Symfony\Component\Messenger\Stamp\SentToFailureTransportStamp;
+use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
 use Symfony\Component\Messenger\Transport\Receiver\ListableReceiverInterface;
 use Symfony\Component\Messenger\Transport\Receiver\ReceiverInterface;
 use Symfony\Component\Messenger\Transport\Receiver\SingleMessageReceiver;
@@ -63,6 +65,7 @@ class FailedMessagesRetryCommand extends AbstractFailedMessagesCommand implement
             ->setDefinition([
                 new InputArgument('id', InputArgument::IS_ARRAY, 'Specific message id(s) to retry'),
                 new InputOption('force', null, InputOption::VALUE_NONE, 'Force action without confirmation'),
+                new InputOption('dispatch', null, InputOption::VALUE_NONE, 'Dispatch messages to their configured transport instead of handling them synchronously'),
                 new InputOption('transport', null, InputOption::VALUE_REQUIRED, 'Use a specific failure transport', self::DEFAULT_TRANSPORT_OPTION),
                 new InputOption('keepalive', null, InputOption::VALUE_REQUIRED, 'Whether to use the transport\'s keepalive mechanism if implemented', self::DEFAULT_KEEPALIVE_INTERVAL),
                 new InputOption('class-filter', null, InputOption::VALUE_REQUIRED, 'Filter by a specific class name'),
@@ -85,6 +88,11 @@ class FailedMessagesRetryCommand extends AbstractFailedMessagesCommand implement
                 Or pass multiple ids at once to process multiple messages:
 
                 <info>php %command.full_name% {id1} {id2} {id3}</info>
+
+                Add "--dispatch" to send selected messages through the bus again, allowing
+                their configured transport to process them instead of this command:
+
+                    <info>php %command.full_name% {id1} {id2} --force --dispatch</info>
 
                 Instead of ids, messages can be selected by class name, by failure time, or by both:
 
@@ -140,6 +148,7 @@ class FailedMessagesRetryCommand extends AbstractFailedMessagesCommand implement
         $io->writeln(\sprintf('To retry all the messages, run <comment>messenger:consume %s</comment>', $failureTransportName));
 
         $shouldForce = $input->getOption('force');
+        $shouldDispatch = $input->getOption('dispatch');
 
         if (null !== $classFilter || null !== $failedAfter || null !== $failedBefore) {
             if (!$receiver instanceof ListableReceiverInterface) {
@@ -158,12 +167,12 @@ class FailedMessagesRetryCommand extends AbstractFailedMessagesCommand implement
                 throw new RuntimeException('Message id must be passed when in non-interactive mode.');
             }
 
-            $this->runInteractive($failureTransportName, $io, $errorIo, $shouldForce);
+            $this->runInteractive($failureTransportName, $io, $errorIo, $shouldForce, $shouldDispatch);
 
             return 0;
         }
 
-        $this->retrySpecificIds($failureTransportName, $ids, $io, $errorIo, $shouldForce);
+        $this->retrySpecificIds($failureTransportName, $ids, $io, $errorIo, $shouldForce, $shouldDispatch);
 
         if (!$this->shouldStop) {
             $io->success('All done!');
@@ -199,7 +208,7 @@ class FailedMessagesRetryCommand extends AbstractFailedMessagesCommand implement
         return $this->forceExit ? 0 : false;
     }
 
-    private function runInteractive(string $failureTransportName, SymfonyStyle $io, SymfonyStyle $errorIo, bool $shouldForce): void
+    private function runInteractive(string $failureTransportName, SymfonyStyle $io, SymfonyStyle $errorIo, bool $shouldForce, bool $shouldDispatch): void
     {
         $receiver = $this->failureTransports->get($failureTransportName);
         $count = 0;
@@ -226,11 +235,11 @@ class FailedMessagesRetryCommand extends AbstractFailedMessagesCommand implement
                     break;
                 }
 
-                $this->retrySpecificEnvelopes($envelopes, $failureTransportName, $io, $errorIo, $shouldForce);
+                $this->retrySpecificEnvelopes($envelopes, $failureTransportName, $io, $errorIo, $shouldForce, $shouldDispatch);
             }
         } else {
             // get() and ask messages one-by-one
-            $count = $this->runWorker($failureTransportName, $receiver, $io, $errorIo, $shouldForce);
+            $count = $this->runWorker($failureTransportName, $receiver, $io, $errorIo, $shouldForce, $shouldDispatch);
         }
 
         // avoid success message if nothing was processed
@@ -239,10 +248,10 @@ class FailedMessagesRetryCommand extends AbstractFailedMessagesCommand implement
         }
     }
 
-    private function runWorker(string $failureTransportName, ReceiverInterface $receiver, SymfonyStyle $io, SymfonyStyle $errorIo, bool $shouldForce): int
+    private function runWorker(string $failureTransportName, ReceiverInterface $receiver, SymfonyStyle $io, SymfonyStyle $errorIo, bool $shouldForce, bool $shouldDispatch): int
     {
         $count = 0;
-        $listener = function (WorkerMessageReceivedEvent $messageReceivedEvent) use ($io, $errorIo, $receiver, $shouldForce, &$count) {
+        $listener = function (WorkerMessageReceivedEvent $messageReceivedEvent) use ($io, $errorIo, $receiver, $shouldForce, $shouldDispatch, &$count) {
             ++$count;
             $envelope = $messageReceivedEvent->getEnvelope();
 
@@ -257,6 +266,20 @@ class FailedMessagesRetryCommand extends AbstractFailedMessagesCommand implement
             }
 
             if ($shouldHandle) {
+                if (!$shouldDispatch) {
+                    return;
+                }
+
+                $this->messageBus->dispatch($envelope
+                    ->withoutStampsOfType(NonSendableStampInterface::class)
+                    ->withoutAll(SentToFailureTransportStamp::class)
+                    ->withoutAll(TransportMessageIdStamp::class)
+                );
+
+                $messageReceivedEvent->shouldHandle(false);
+                $receiver->ack($envelope);
+                $this->worker?->stop();
+
                 return;
             }
 
@@ -286,7 +309,7 @@ class FailedMessagesRetryCommand extends AbstractFailedMessagesCommand implement
         return $count;
     }
 
-    private function retrySpecificIds(string $failureTransportName, array $ids, SymfonyStyle $io, SymfonyStyle $errorIo, bool $shouldForce): void
+    private function retrySpecificIds(string $failureTransportName, array $ids, SymfonyStyle $io, SymfonyStyle $errorIo, bool $shouldForce, bool $shouldDispatch): void
     {
         $receiver = $this->getReceiver($failureTransportName);
 
@@ -306,7 +329,7 @@ class FailedMessagesRetryCommand extends AbstractFailedMessagesCommand implement
             }
 
             $singleReceiver = new SingleMessageReceiver($receiver, $envelope);
-            $this->runWorker($failureTransportName, $singleReceiver, $io, $errorIo, $shouldForce);
+            $this->runWorker($failureTransportName, $singleReceiver, $io, $errorIo, $shouldForce, $shouldDispatch);
 
             if ($this->shouldStop) {
                 break;
@@ -314,13 +337,13 @@ class FailedMessagesRetryCommand extends AbstractFailedMessagesCommand implement
         }
     }
 
-    private function retrySpecificEnvelopes(array $envelopes, string $failureTransportName, SymfonyStyle $io, SymfonyStyle $errorIo, bool $shouldForce): void
+    private function retrySpecificEnvelopes(array $envelopes, string $failureTransportName, SymfonyStyle $io, SymfonyStyle $errorIo, bool $shouldForce, bool $shouldDispatch): void
     {
         $receiver = $this->getReceiver($failureTransportName);
 
         foreach ($envelopes as $envelope) {
             $singleReceiver = new SingleMessageReceiver($receiver, $envelope);
-            $this->runWorker($failureTransportName, $singleReceiver, $io, $errorIo, $shouldForce);
+            $this->runWorker($failureTransportName, $singleReceiver, $io, $errorIo, $shouldForce, $shouldDispatch);
 
             if ($this->shouldStop) {
                 break;
