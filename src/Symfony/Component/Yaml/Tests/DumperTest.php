@@ -66,7 +66,8 @@ class DumperTest extends TestCase
             bar:
                    - 1
                    - foo
-                   - a: A
+                   -
+                          a: A
             foobar:
                    foo: bar
                    bar:
@@ -111,15 +112,15 @@ class DumperTest extends TestCase
         }
     }
 
-    public function testDumpSimpleHashesInSequencesCompactly()
+    public function testDumpSimpleHashesInSequences()
     {
         $data = ['servers' => [['url' => 'http://example.com']]];
-        $expected = "servers:\n    - url: 'http://example.com'\n";
+        $expected = "servers:\n    -\n        url: 'http://example.com'\n";
         $this->assertSame($expected, $this->dumper->dump($data, 3));
         $this->assertSameData($data, $this->parser->parse($expected));
 
         $data = ['servers' => [['url' => 'http://example.com', 'port' => 80]]];
-        $expected = "servers:\n    - url: 'http://example.com'\n      port: 80\n";
+        $expected = "servers:\n    -\n        url: 'http://example.com'\n        port: 80\n";
         $this->assertSame($expected, $this->dumper->dump($data, 3));
         $this->assertSameData($data, $this->parser->parse($expected));
     }
@@ -168,7 +169,8 @@ class DumperTest extends TestCase
             bar:
                 - 1
                 - foo
-                - a: A
+                -
+                    a: A
             foobar:
                 foo: bar
                 bar:
@@ -189,7 +191,8 @@ class DumperTest extends TestCase
             bar:
                 - 1
                 - foo
-                - a: A
+                -
+                    a: A
             foobar:
                 foo: bar
                 bar:
